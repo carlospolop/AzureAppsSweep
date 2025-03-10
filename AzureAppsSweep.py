@@ -5716,7 +5716,7 @@ def authenticate_username_password_native(username, password, client_id, resourc
     return token_info, is_valid
 
 
-def process_app_client(name, client_id, username, password, outfile_path, file_lock, valid_lock, print_errors):
+def process_app_client(name, client_id, username, password, outfile_path, file_lock, valid_lock, print_errors, print_validate):
     """
     **Process a single app and client ID combination.**
     Iterates through all resource URIs and attempts authentication.
@@ -5736,7 +5736,7 @@ def process_app_client(name, client_id, username, password, outfile_path, file_l
                 if print_errors:
                     print(f"{Fore.YELLOW}Error details: {token.get('error_description', 'No details provided')}{Style.RESET_ALL}")
             
-            if last_error == "Need client_secret":
+            if last_error == "Need client_secret" and print_validate:
                 with valid_lock:
                     if name in INVALID_APPS:
                         if client_id not in INVALID_APPS[name]:
@@ -5759,12 +5759,13 @@ def process_app_client(name, client_id, username, password, outfile_path, file_l
                 f.write(f"App: {name}, Client: {client_id}, Resource: {res_uri}, Token: {token}\n\n\n")
     
     # **Update the global VALID_APPS or INVALID_APPS dictionaries safely**
-    with valid_lock:
-        if name in VALID_APPS:
-            if client_id not in VALID_APPS[name]:
-                VALID_APPS[name].append(client_id)
-        else:
-            VALID_APPS[name] = [client_id]
+    if print_validate:
+        with valid_lock:
+            if name in VALID_APPS:
+                if client_id not in VALID_APPS[name]:
+                    VALID_APPS[name].append(client_id)
+            else:
+                VALID_APPS[name] = [client_id]
 
 def main():
     """
@@ -5779,6 +5780,7 @@ def main():
     parser.add_argument('--outfile', required=True, type=str, help='File path to write tokens')
     parser.add_argument('--print-errors', action='store_true', help='Print the whole error description.')
     parser.add_argument('--threads', type=int, default=5, help='Number of threads (default 5)')
+    parser.add_argument('--print-validate', action='store_true', help='Print jsons of valid and invalid (secret required) apps')
     args = parser.parse_args()
 
     username = args.username
@@ -5786,6 +5788,7 @@ def main():
     outfile_path = args.outfile
     print_errors = args.print_errors
     n_threads = args.threads
+    print_validate = args.print_validate
 
     # **Initialize locks for thread-safe file writing and dictionary updates**
     file_lock = threading.Lock()
@@ -5797,17 +5800,18 @@ def main():
         for name, client_ids in APPS.items():
             for client_id in client_ids:
                 #print(f"{Fore.CYAN}Logging into app {name} ({client_id}){Style.RESET_ALL}")
-                future = executor.submit(process_app_client, name, client_id, username, password, outfile_path, file_lock, valid_lock, print_errors)
+                future = executor.submit(process_app_client, name, client_id, username, password, outfile_path, file_lock, valid_lock, print_errors, print_validate)
                 futures.append(future)
         # Wait for all threads to finish
         concurrent.futures.wait(futures)
     
-    print(f"{Fore.MAGENTA}=============================={Style.RESET_ALL}")
-    print(f"{Fore.RED}Invalid apps:{Style.RESET_ALL}")
-    print(json.dumps(INVALID_APPS, indent=4))
-    print("===============================")
-    print(f"{Fore.GREEN}Valid apps:{Style.RESET_ALL}")
-    print(json.dumps(VALID_APPS, indent=4))
+    if print_validate:
+        print(f"{Fore.MAGENTA}=============================={Style.RESET_ALL}")
+        print(f"{Fore.RED}Invalid apps:{Style.RESET_ALL}")
+        print(json.dumps(INVALID_APPS, indent=4))
+        print("===============================")
+        print(f"{Fore.GREEN}Valid apps:{Style.RESET_ALL}")
+        print(json.dumps(VALID_APPS, indent=4))
 
 if __name__ == "__main__":
     main()
