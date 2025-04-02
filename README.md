@@ -12,5 +12,10 @@ For more information check:
 ## Usage
 
 ```bash
+# Do an app sweep
 python3 AzureAppsSweep.py --username <email> --password <password> [--threads 5] [--print-errors]
+
+# Use --get-foci-apps to get a list of applications that are FOCI (but not do an app sweep).
+## Useful to improve the FOCI list from time to time (use it if you know what you are doing).
+python3 AzureAppsSweep.py --get-foci-apps --username <email> --password <password> [--threads 5]
 ```
