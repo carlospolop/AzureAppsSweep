@@ -8,6 +8,7 @@ from colorama import init, Fore, Style
 import json
 import tempfile
 import threading
+import time
 
 
 lock = threading.Lock()
@@ -66,6 +67,9 @@ def get_accesstoken_from_foci(client_id, scopes, foci_refresh_token, tenant_id):
     try:
         tokens = app.acquire_token_by_refresh_token(foci_refresh_token, scopes=scopes)
     except Exception as e:
+        if "Connection aborted." in str(e) or "Read timed out" in str(e):
+            time.sleep(15)
+            return get_accesstoken_from_foci(client_id, scopes, foci_refresh_token, tenant_id)
         if not "API does not accept frozenset" in str(e):
             print(f"{Fore.RED}Error acquiring token: {e}{Style.RESET_ALL}")
         tokens = {}
@@ -114,12 +118,11 @@ def add_scopes(app_id, req_scope, scopes):
         FOUND_SCOPES_BY_APPS[app_id][req_scope] = scopes
 
         # Add to FOUND_APPS_BY_SCOPES
-        for scope in scopes:
-            if scope not in FOUND_APPS_BY_SCOPES:
-                FOUND_APPS_BY_SCOPES[scope] = {}
-            if app_id not in FOUND_APPS_BY_SCOPES[scope]:
-                FOUND_APPS_BY_SCOPES[scope][app_id] = []
-            FOUND_APPS_BY_SCOPES[scope][app_id].append(req_scope)
+        if req_scope not in FOUND_APPS_BY_SCOPES:
+            FOUND_APPS_BY_SCOPES[req_scope] = {}
+        if app_id not in FOUND_APPS_BY_SCOPES[req_scope]:
+            FOUND_APPS_BY_SCOPES[req_scope][app_id] = []
+        FOUND_APPS_BY_SCOPES[req_scope][app_id] = scopes
 
 
 def down_graph_scopes():
