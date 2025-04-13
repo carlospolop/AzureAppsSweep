@@ -54,8 +54,51 @@ FOCI_APPS = [
     "eb20f3e3-3dce-4d2c-b721-ebb8d4414067"
 ]
 
+RESOURCES = [
+    "https://graph.windows.net",
+    "https://substrate.office.com",
+    "https://outlook.office.com",
+    "https://graph.microsoft.com",
+    "https://management.core.windows.net",
+    "https://outlook.office365.com",
+    "https://api.spaces.skype.com",
+    "https://manage.office.com",
+    "https://msmamservice.api.application",
+    "https://officeapps.live.com",
+    "https://api.diagnostics.office.com",
+    "https://{tenant_id}-my.sharepoint.com",
+    "https://{tenant_id}.sharepoint.com",
+    "https://webshell.suite.office.com",
+    "https://batch.core.windows.net",
+    "https://management.azure.com/",
+    "https://{tenant_id}-admin.sharepoint.com",
+    "https://analysis.windows.net/powerbi/api",
+    "https://quantum.microsoft.com",
+    "https://database.windows.net",
+    "https://storage.azure.com",
+    "https://compliance.microsoft.com",
+    "https://iothubs.azure.net",
+    "https://dev.azuresynapse.net",
+    "https://rest.media.azure.net",
+    "https://api.loganalytics.io",
+    "https://datalake.azure.net",
+    "https://vault.azure.net",
+    "https://www.yammer.com",
+    "https://digitaltwins.azure.net",
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+    "1950a258-227b-4e31-a9cf-717495945fc2",
+    "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
+    "27922004-5251-4030-b22d-91ecd9a37ea4",
+    "4813382a-8fa7-425e-ab75-3b753aab3abb",
+    "872cd9fa-d31f-45e0-9eab-6e460a02d1f1",
+    "ab9b8c07-8f02-4f72-87fa-80105867a763",
+    "af124e86-4e96-495a-b70a-90f90ab96707",
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+]
+
 FOUND_SCOPES_BY_APPS = {}
 FOUND_APPS_BY_SCOPES = {}
+FOUND_AUDS_BY_APPS = {}
 
 def get_accesstoken_from_foci(client_id, scopes, foci_refresh_token, tenant_id):
     """
@@ -93,36 +136,61 @@ def get_tokens_from_foci(scope, foci_refresh_token, tenant_id):
         
         token = resp.get("access_token")
         if token:
-            decoded = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
-            scopes_str = decoded.get('scp')
+            try:
+                decoded = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
+                scopes_str = decoded.get('scp')
+                aud = decoded.get('aud')
+            except jwt.DecodeError as e: # There are some encrypted access tokens we cannot access
+                id_token = resp["id_token"]
+                decoded = jwt.decode(id_token, options={"verify_signature": False, "verify_aud": False})
+                scopes_str = resp.get("scope")
+                aud = decoded.get('aud')
+                        
             if scopes_str:
-                scopes_list = [s.strip() for s in scopes_str.split(",")]
-                add_scopes(app_id, scope, scopes_list)
+                scopes_list = [s.strip() for s in scopes_str.split(" ")]
+                add_scopes(app_id, scope, scopes_list, aud)
         else:
             if 65002 in resp.get("error_codes", []):
                 pass
             else:
                 _ = 1
 
-def add_scopes(app_id, req_scope, scopes):
+def add_scopes(app_id, req_scope, scopes, aud):
     """
     Add scopes to the global dictionaries with thread-safe locking.
     """
     global FOUND_SCOPES_BY_APPS
     global FOUND_APPS_BY_SCOPES
+    global FOUND_AUDS_BY_APPS
+    global lock
 
     with lock:
         # Add to FOUND_SCOPES_BY_APPS
         if app_id not in FOUND_SCOPES_BY_APPS:
             FOUND_SCOPES_BY_APPS[app_id] = {}
-        FOUND_SCOPES_BY_APPS[app_id][req_scope] = scopes
+        if req_scope not in FOUND_SCOPES_BY_APPS[app_id]:
+            FOUND_SCOPES_BY_APPS[app_id][req_scope] = {}
+        if aud not in FOUND_SCOPES_BY_APPS[app_id][req_scope]:
+            FOUND_SCOPES_BY_APPS[app_id][req_scope][aud] = []
+        FOUND_SCOPES_BY_APPS[app_id][req_scope][aud] = scopes
 
         # Add to FOUND_APPS_BY_SCOPES
         if req_scope not in FOUND_APPS_BY_SCOPES:
             FOUND_APPS_BY_SCOPES[req_scope] = {}
-        if app_id not in FOUND_APPS_BY_SCOPES[req_scope]:
-            FOUND_APPS_BY_SCOPES[req_scope][app_id] = []
-        FOUND_APPS_BY_SCOPES[req_scope][app_id] = scopes
+        if aud not in FOUND_APPS_BY_SCOPES[req_scope]:
+            FOUND_APPS_BY_SCOPES[req_scope][aud] = {}
+        if app_id not in FOUND_APPS_BY_SCOPES[req_scope][aud]:
+            FOUND_APPS_BY_SCOPES[req_scope][aud][app_id] = []
+        FOUND_APPS_BY_SCOPES[req_scope][aud][app_id] = scopes
+
+        # Add to FOUND_AUDS_BY_APPS
+        if aud not in FOUND_AUDS_BY_APPS:
+            FOUND_AUDS_BY_APPS[aud] = {}
+        if app_id not in FOUND_AUDS_BY_APPS[aud]:
+            FOUND_AUDS_BY_APPS[aud][app_id] = []
+        for scope in scopes: # Get total scoeps that cna be gathered and not by req_scope
+            if scope not in FOUND_AUDS_BY_APPS[aud][app_id]:
+                FOUND_AUDS_BY_APPS[aud][app_id].append(scope)
 
 
 def down_graph_scopes():
@@ -166,19 +234,45 @@ def main():
             total=len(scopes),
             desc=f"{Fore.YELLOW}Processing scopes{Style.RESET_ALL}"
         ))
+    
+    resource_scopes = [
+        f"{resource.replace('{tenant_id}', tenant_id.split('.')[0])}/.default" for resource in RESOURCES
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        list(tqdm(
+            executor.map(lambda s: get_tokens_from_foci(s, foci_refresh_token, tenant_id), resource_scopes),
+            total=len(resource_scopes),
+            desc=f"{Fore.YELLOW}Processing resources{Style.RESET_ALL}"
+        ))
 
     # Print the found scopes by apps with colored output
     print(f"\n{Fore.GREEN}Found scopes by apps:{Style.RESET_ALL}")
     for app_id, scope_dict in FOUND_SCOPES_BY_APPS.items():
-        print(f"{Fore.BLUE}App ID: {app_id}{Style.RESET_ALL}")
-        for req_scope, found_scopes in scope_dict.items():
-            print(f"  {Fore.MAGENTA}Scope: {req_scope}{Style.RESET_ALL}, Found Scopes: {Fore.YELLOW}{found_scopes}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}App ID: {app_id}{Style.RESET_ALL}")
+        for req_scope, values in scope_dict.items():
+            print(f"  {Fore.BLUE}Scope: {req_scope}{Style.RESET_ALL}")
+            for aud, found_scopes in values.items():
+                print(f"    {Fore.YELLOW}Aud: {aud}{Style.RESET_ALL}")
+                print(f"    Found Scopes: {found_scopes}{Style.RESET_ALL}")
+        print()
 
     print(f"\n{Fore.GREEN}Found apps by scopes:{Style.RESET_ALL}")
     for scope, apps in FOUND_APPS_BY_SCOPES.items():
-        print(f"{Fore.BLUE}Scope: {scope}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}Scope: {scope}{Style.RESET_ALL}")
+        for aud, found_scopes in apps.items():
+            print(f"  {Fore.BLUE}Aud: {aud}{Style.RESET_ALL}")
+            for app_id, found_scopes in found_scopes.items():
+                print(f"    {Fore.YELLOW}App ID: {app_id}{Style.RESET_ALL}")
+                print(f"    Found Scopes: {found_scopes}{Style.RESET_ALL}")
+        print()
+    
+    print(f"\n{Fore.GREEN}Found auds by apps:{Style.RESET_ALL}")
+    for aud, apps in FOUND_AUDS_BY_APPS.items():
+        print(f"{Fore.MAGENTA}Aud: {aud}{Style.RESET_ALL}")
         for app_id, found_scopes in apps.items():
-            print(f"  {Fore.MAGENTA}App ID: {app_id}{Style.RESET_ALL}, Found Scopes: {Fore.YELLOW}{found_scopes}{Style.RESET_ALL}")
+            print(f"    {Fore.YELLOW}App ID: {app_id}{Style.RESET_ALL}")
+            print(f"    Found Scopes: {found_scopes}{Style.RESET_ALL}")
+        print()
 
     # Dump the global variables to a temporary files
     with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json", prefix="dump_scopes_by_apps_") as temp_file:
@@ -190,6 +284,11 @@ def main():
         json.dump(FOUND_APPS_BY_SCOPES, temp_file, indent=4)
         temp_filename = temp_file.name
         print(f"\n{Fore.CYAN}Apps by scopes info dumped in JSON dumped to file: {temp_filename}{Style.RESET_ALL}")
+    
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json", prefix="dump_auds_by_apps_") as temp_file:
+        json.dump(FOUND_AUDS_BY_APPS, temp_file, indent=4)
+        temp_filename = temp_file.name
+        print(f"\n{Fore.CYAN}Auds by apps info dumped in JSON dumped to file: {temp_filename}{Style.RESET_ALL}")
 
 if __name__ == "__main__":
     main()
