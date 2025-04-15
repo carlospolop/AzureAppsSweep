@@ -5873,7 +5873,7 @@ def authenticate_username_password_native(username, password, client_id, resourc
             error_summary = "Disabled"
         elif error_code == 700016:
             error_summary = "Not installed"
-        elif error_code == 50076:
+        elif error_code == 50076 or error_code == 50079:
             error_summary = "MFA required"
         elif error_code == 53003:
             error_summary = "Conditional Access Policy"
@@ -5889,8 +5889,8 @@ def authenticate_username_password_native(username, password, client_id, resourc
             exit(1)
         else:
             error_summary = "Unknown error"
-            #print(error_code)
-            #print(error_msg)
+            print(error_code)
+            print(error_msg)
     
         return {"error_description": error_msg, "error_summary": error_summary, "login_error": True}
     
