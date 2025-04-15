@@ -49,6 +49,12 @@ List of Application (Client) IDs from:
 """
 
 APPS = {
+    "Azure Resource Manager": [
+        "797f4846-ba00-4fd7-ba43-dac1f8f63013"
+    ],
+    "O365 LinkedIn Connection": [
+        "f569b9c7-be15-4e87-86f7-87d30d02090b"
+    ],
     "FindTime": [
         "9758a0e2-7861-440f-b467-1823144e5b65"
     ],
