@@ -130,17 +130,11 @@ APPS = {
     "MicrosoftTeams": [
         "1fec8e78-bce4-4aaf-ab1b-5451cc387264"
     ],
-    "Office365SharePointOnline": [
-        "00000003-0000-0ff1-ce00-000000000000"
-    ],
     "OutlookMobile": [
         "27922004-5251-4030-b22d-91ecd9a37ea4"
     ],
     "OneDriveSyncEngine": [
         "ab9b8c07-8f02-4f72-87fa-80105867a763"
-    ],
-    "SkypeforBusinessOnline": [
-        "00000004-0000-0ff1-ce00-000000000000"
     ],
     "UniversalStoreNativeClient": [
         "268761a2-03f3-40df-8a8b-c3db24145b6b"
@@ -1435,6 +1429,12 @@ APPS = {
 }
 
 REQUIRE_SECRET_APPS = {
+    "SkypeforBusinessOnline": [
+        "00000004-0000-0ff1-ce00-000000000000"
+    ],
+    "Office365SharePointOnline": [
+        "00000003-0000-0ff1-ce00-000000000000"
+    ],
     "App Service": [
         "7ab7862c-4c57-491e-8a45-d52a7e023983"
     ],
@@ -5910,7 +5910,8 @@ def process_app_client(name, client_id, username, password, outfile_path, file_l
             last_error = token.get("error_summary", "Unknown error")
             # If this is the last resource URI, print the error details.
             if res_uri == RESOURCE_URIS[-1]:
-                print(f"{Fore.RED}Failed to create token for app {name} ({client_id}) with {res_uri}. Reason: {last_error}{Style.RESET_ALL}")
+                if last_error != "Not consented by resource" or print_errors:
+                    print(f"{Fore.RED}Failed to create token for app {name} ({client_id}) with {res_uri}. Reason: {last_error}{Style.RESET_ALL}")
                 if print_errors:
                     print(f"{Fore.YELLOW}Error details: {token.get('error_description', 'No details provided')}{Style.RESET_ALL}")
             
