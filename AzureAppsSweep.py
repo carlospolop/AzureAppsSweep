@@ -5879,6 +5879,8 @@ def authenticate_username_password_native(username, password, client_id, resourc
             error_summary = "Conditional Access Policy"
         elif error_code == 7000218:
             error_summary = "Need client_secret"
+        elif error_code == 700019:
+            error_summary = "Cannot be used or is not authorized"
         elif error_code == 50034:
             error_summary = "Unknown user, not going to continue"
             print(f"{Fore.RED}{error_summary}{Style.RESET_ALL}")
