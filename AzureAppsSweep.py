@@ -6014,6 +6014,7 @@ def main():
 
     foci_refresh_token = ""
     if get_foci_apps:
+        print(f"{Fore.MAGENTA}You used the '--get-foci-apps' arg, note that this won't search for bypasses but just check the configured apps to find wich ones are FOCI apps. This is a research behaviour and potentially not what you want to do. To find bypasses just pass '--username <email> --password <password>'.{Style.RESET_ALL}")
         tokens = authenticate_username_password_native(username, password, "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "https://management.azure.com/")
         foci_refresh_token = tokens["refresh_token"]
 
