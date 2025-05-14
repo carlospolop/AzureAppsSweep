@@ -5942,7 +5942,7 @@ def process_app_client(name, client_id, username, password, outfile_path, file_l
         
         # Write token information to the temporary file in a thread-safe manner
         with file_lock:
-            with open(outfile_path, "w") as f:
+            with open(outfile_path, "a") as f:
                 f.write(f"App: {name}, Client: {client_id}, Resource: {res_uri}, Token: {token}\n\n\n")
     
     # Update the global VALID_APPS or INVALID_APPS dictionaries safely
