@@ -5915,7 +5915,7 @@ def authenticate_username_password_native(username, password, client_id, resourc
     tenant = username.split("@")[1]
     authority_url = f'https://login.microsoftonline.com/{tenant}'
     res = requests.post(f"{authority_url}/oauth2/token", data=data, timeout=30)
-    
+
     if res.status_code != 200:
         error_msg = res.json().get("error_description")
         error_code = res.json().get("error_codes")[0]
@@ -5934,7 +5934,7 @@ def authenticate_username_password_native(username, password, client_id, resourc
             console.print(f"[red]{error_msg}[/red]")
 
         return {"error_description": error_msg, "error_summary": error_summary, "login_error": True}
-    
+
     token_info = res.json()
     token_info["is_foci"] = client_id in FOCI_APPS
     return token_info
@@ -6163,11 +6163,10 @@ def process_app_client(name, client_id, username, password, prt, session_key, ou
         if token.get("login_error"):
             last_error = token.get("error_summary", "Unknown error")
 
-            # Print error on last resource URI attempt
-            is_last_resource = (res_uri == RESOURCE_URIS[-1])
+            # Print error for each attempt
             should_print_error = (last_error != "Not consented by resource" or print_errors)
 
-            if is_last_resource and should_print_error:
+            if should_print_error:
                 output_console.print(f"[red]FAIL[/red] [cyan]{name}[/cyan] ({client_id}) with {res_uri}. Reason: [yellow]{last_error}[/yellow]")
                 if print_errors:
                     output_console.print(f"  [dim]Details: {token.get('error_description', 'No details provided')}[/dim]")
